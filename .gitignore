@@ -1,0 +1,16 @@
+# Pastas de compilação (lixo gerado)
+/build/
+/managed_components/
+
+# Arquivos de configuração do sistema (opcional: pode versionar o sdkconfig se quiser manter a config fixa)
+sdkconfig.old
+sdkconfig.ci
+
+# Arquivos temporários do editor
+.vscode/
+.idea/
+*.DS_Store
+
+# Arquivos Python compilados
+__pycache__/
+*.pyc
