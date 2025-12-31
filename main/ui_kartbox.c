@@ -4,25 +4,25 @@
 #include "bsp/esp-bsp.h"
 #include "telemetry_sd.h"
 #include "telemetry_gps.h"
+#include "usb_mode.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_system.h" // <--- NOVO INCLUDE PARA REINICIAR
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
 // --- DECLARAÇÃO DE FONTES ---
-LV_FONT_DECLARE(font_montserrat_bold_80);   // Velocidade
-LV_FONT_DECLARE(font_montserrat_bold_70);   // Tempo de Volta
-LV_FONT_DECLARE(font_montserrat_medium_60); // Delta (Gap)
-LV_FONT_DECLARE(font_montserrat_60);        
+LV_FONT_DECLARE(font_montserrat_bold_80);
+LV_FONT_DECLARE(font_montserrat_bold_70);
+LV_FONT_DECLARE(font_montserrat_medium_60);
+LV_FONT_DECLARE(font_montserrat_60);
 LV_FONT_DECLARE(font_montserrat_70);
 LV_FONT_DECLARE(font_montserrat_80);
 
 // --- VARIÁVEIS E FUNÇÕES EXTERNAS ---
 extern bool recording_active;
 extern void end_race_session(void);
-
-// Stub para compatibilidade com nomes reais de arquivos do SD
 extern int sd_get_session_string_list(char *buf, size_t max_len) __attribute__((weak));
 
 // --- PALETA DE CORES ---
@@ -48,8 +48,9 @@ static uint16_t ui_total_laps_in_chart = 0;
 
 static lv_style_t style_text_white, style_list_btn, style_big_font;
 
-// Flag de segurança para impedir cliques enquanto a tarefa de salvamento roda
+// Flags de controle
 static volatile bool ui_is_saving_task_running = false;
+static bool ui_usb_mode_active = false; // <--- NOVA FLAG PARA O BOTÃO
 
 // Variáveis para monitoramento de saúde do GPS
 static uint32_t last_gps_packet_time = 0;
@@ -59,7 +60,7 @@ static uint32_t last_ui_tick_check = 0;
 void ui_refresh_session_dropdown(void);
 void ui_update_sd_info(void);
 void ui_show_popup(const char *t, uint32_t d);
-void ui_show_mode_splash(race_mode_t m); // Faltava este protótipo
+void ui_show_mode_splash(race_mode_t m); 
 void ui_clear_lap_list(void);
 void ui_hide_reset_progress(void);
 void ui_update_reset_progress(uint32_t progress);
@@ -86,11 +87,7 @@ static void refresh_history_cb(lv_event_t * e) {
     
     ui_clear_lap_list();
     ui_show_popup("RECARREGANDO...", 500);
-    
-    // Atualiza a lista de arquivos (caso tenha novos)
     ui_refresh_session_dropdown();
-    
-    // Carrega o selecionado
     sd_load_session_history(sel_idx);
 }
 
@@ -99,6 +96,35 @@ static void session_dropdown_cb(lv_event_t * e) {
     uint16_t sel_idx = lv_dropdown_get_selected(dropdown);
     ui_clear_lap_list();
     sd_load_session_history(sel_idx);
+}
+
+// --- CALLBACK DO BOTÃO USB (MODIFICADO) ---
+static void btn_usb_cb(lv_event_t * e) {
+    // CLIQUE 2: REINICIAR O SISTEMA
+    if (ui_usb_mode_active) {
+        ui_show_popup("REINICIANDO...", 5000);
+        // Pequeno delay para a tela atualizar antes de morrer
+        vTaskDelay(pdMS_TO_TICKS(500)); 
+        esp_restart();
+        return;
+    }
+
+    // CLIQUE 1: ATIVAR USB
+    if (recording_active) {
+        ui_show_popup("PARE A GRAVACAO!", 1500);
+        return;
+    }
+    
+    // Inicia o USB
+    usb_mode_start();
+    ui_usb_mode_active = true; // Marca que já ativou
+    
+    // Muda visual do botão
+    lv_obj_t * btn = lv_event_get_target(e);
+    lv_obj_set_style_bg_color(btn, COLOR_PRIMARY, 0); // Fica Verde
+    
+    lv_obj_t * label = lv_obj_get_child(btn, 0);
+    lv_label_set_text(label, "REINICIAR SISTEMA (SAIR)"); // Muda o Texto
 }
 
 static void confirm_delete_cb(lv_event_t * e) {
@@ -135,21 +161,19 @@ static void btn_delete_trigger_cb(lv_event_t * e) {
     lv_obj_t * lt2 = lv_label_create(b2); lv_label_set_text(lt2, "NAO"); lv_obj_center(lt2);
 }
 
-// --- TAREFA DEDICADA PARA SALVAR (FIX CRASH) ---
+// --- TAREFA DEDICADA PARA SALVAR ---
 
 static void ui_notify_save_finished(void * arg) {
     ui_show_popup("SESSAO SALVA", 1500);
     ui_is_saving_task_running = false; 
-    ui_refresh_session_dropdown(); // Atualiza a lista após salvar
+    ui_refresh_session_dropdown(); 
 }
 
 static void save_session_worker_task(void * arg) {
     if (recording_active) {
-        end_race_session(); // Operação pesada de I/O
+        end_race_session(); 
     }
-    // Agenda a notificação na thread da UI
     lv_async_call(ui_notify_save_finished, NULL);
-    // Mata a tarefa worker
     vTaskDelete(NULL);
 }
 
@@ -177,7 +201,6 @@ static void digital_btn_cb(lv_event_t * e) {
                 
                 if (recording_active) {
                     ui_is_saving_task_running = true; 
-                    // Cria tarefa dedicada com 4KB de pilha
                     xTaskCreate(save_session_worker_task, "SaveTask", 4096, NULL, 5, NULL);
                 } else {
                     ui_show_popup("SEM CORRIDA ATIVA", 1000);
@@ -190,7 +213,6 @@ static void digital_btn_cb(lv_event_t * e) {
             uint32_t elapsed = lv_tick_elaps(press_start_tick);
             ui_hide_reset_progress();
 
-            // CLIQUE CURTO: Só reseta se NÃO estiver gravando
             if(!long_press_triggered && elapsed < 500) {
                 if(!recording_active) {
                     gps_reset_session(); 
@@ -393,9 +415,21 @@ void ui_init(void) {
     lv_obj_set_style_text_font(lbl_sd_storage, &lv_font_montserrat_32, 0);
     lv_obj_align(lbl_sd_storage, LV_ALIGN_TOP_MID, 0, 60);
 
+    // --- BOTÃO USB (COM FUNÇÃO DE REINICIAR) ---
+    lv_obj_t * b_usb = lv_button_create(t3);
+    lv_obj_set_size(b_usb, 450, 70);
+    lv_obj_align(b_usb, LV_ALIGN_CENTER, 0, -20); // Centralizado verticalmente
+    lv_obj_set_style_bg_color(b_usb, lv_color_hex(0x444444), 0);
+    lv_obj_add_event_cb(b_usb, btn_usb_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t * lt_usb = lv_label_create(b_usb); 
+    lv_label_set_text(lt_usb, "MODO PEN DRIVE (USB)"); 
+    lv_obj_center(lt_usb);
+
+    // --- BOTÃO APAGAR TUDO ---
     lv_obj_t * b_del = lv_button_create(t3);
     lv_obj_set_size(b_del, 450, 70);
-    lv_obj_align(b_del, LV_ALIGN_CENTER, 0, 80);
+    lv_obj_align(b_del, LV_ALIGN_CENTER, 0, 80); // Movido para baixo
     lv_obj_set_style_bg_color(b_del, COLOR_DANGER, 0);
     lv_obj_add_event_cb(b_del, btn_delete_trigger_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t * lt_del = lv_label_create(b_del); lv_label_set_text(lt_del, "APAGAR TUDO (SD CARD)"); lv_obj_center(lt_del);
@@ -515,7 +549,6 @@ void ui_add_lap_to_list(uint16_t num, uint32_t ms) {
 void ui_refresh_session_dropdown(void) {
     if (!dd_sessions) return;
     
-    // Tenta usar a função de nomes reais do telemetry_sd.c
     if (sd_get_session_string_list) {
         char *buf = malloc(4096); 
         if (buf) {
@@ -529,7 +562,6 @@ void ui_refresh_session_dropdown(void) {
         }
     }
 
-    // Fallback para contagem simples se a função não existir
     uint16_t sessions[50]; int count = sd_get_available_sessions(sessions, 50);
     if (count == 0) { lv_dropdown_set_options(dd_sessions, "Vazio"); return; }
     char *buf = malloc(4096); buf[0] = '\0';
@@ -539,8 +571,6 @@ void ui_refresh_session_dropdown(void) {
     lv_dropdown_set_options(dd_sessions, buf);
     free(buf);
 }
-
-// --- IMPLEMENTAÇÃO DAS FUNÇÕES AUXILIARES QUE FALTAVAM ---
 
 void ui_update_sd_info(void) {
     if (!lbl_sd_storage) return;
