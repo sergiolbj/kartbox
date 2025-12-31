@@ -18,7 +18,7 @@ static uint16_t current_session_id = 1;
 static char session_filename[128] = {0}; 
 
 bool sd_init(void) {
-    // Configuração do LDO (Regulador) - Ajuste conforme seu hardware
+    // Configuração do LDO (Regulador)
     esp_ldo_channel_handle_t ldo_h;
     esp_ldo_channel_config_t ldo_c = { .chan_id = 4, .voltage_mv = 3300 };
     esp_ldo_acquire_channel(&ldo_c, &ldo_h);
@@ -42,7 +42,6 @@ bool sd_init(void) {
 
     mounted = true;
     
-    // Recupera último ID
     FILE *f = fopen("/sdcard/last_id.txt", "r");
     if (f) { fscanf(f, "%hu", &current_session_id); fclose(f); }
     
@@ -61,7 +60,11 @@ void sd_start_new_session(gps_data_t gps) {
     
     char path[256]; snprintf(path, 256, "/sdcard/data_%s.csv", session_filename);
     f_telemetry = fopen(path, "w");
-    if (f_telemetry) fprintf(f_telemetry, "Timestamp_ms,Lat,Lon,Speed,Mode,Lap\n");
+    
+    // [CORREÇÃO] Cabeçalho completo para análise detalhada (Google Earth, MoTeC, etc)
+    if (f_telemetry) {
+        fprintf(f_telemetry, "Timestamp_ms,Date,Time,Mode,Lap,Speed,Lat,Lon\n");
+    }
 }
 
 void sd_stop_session(void) { if (f_telemetry) { fclose(f_telemetry); f_telemetry = NULL; } }
@@ -69,14 +72,33 @@ void sd_stop_session(void) { if (f_telemetry) { fclose(f_telemetry); f_telemetry
 void sd_save_lap_event(uint16_t lap, uint32_t ms, float avg_speed, gps_data_t gps, race_mode_t mode) {
     if (!mounted) return;
     char path[256]; snprintf(path, 256, "/sdcard/laps_%s.csv", session_filename);
+    
+    // Verifica se o arquivo é novo para escrever o cabeçalho
+    FILE *check = fopen(path, "r");
+    bool new_file = (check == NULL);
+    if (check) fclose(check);
+
     FILE *fl = fopen(path, "a+");
     if (fl) { 
-        fprintf(fl, "%d,%lu.%03lu,%.1f\n", lap, ms/1000, ms%1000, avg_speed); 
+        // [CORREÇÃO] Cabeçalho no arquivo de voltas também
+        if (new_file) {
+            fprintf(fl, "Lap,Time,Avg_Speed,Mode,Date,Time_of_Day\n");
+        }
+        
+        char time_str[16];
+        snprintf(time_str, 16, "%02d:%02d:%02d", gps.hour, gps.minute, gps.second);
+        
+        // Dados completos da volta
+        fprintf(fl, "%d,%lu.%03lu,%.1f,%s,%02d/%02d/%02d,%s\n", 
+                lap, ms/1000, ms%1000, avg_speed, 
+                (mode == MODE_CLASSIFICACAO ? "QUALY" : "RACE"),
+                gps.day, gps.month, gps.year,
+                time_str);
+        
         fclose(fl); 
     }
 }
 
-// Mantido para compatibilidade
 int sd_get_available_sessions(uint16_t *session_list, int max) {
     if (!mounted) return 0;
     DIR *dir = opendir("/sdcard"); if (!dir) return 0;
@@ -87,7 +109,6 @@ int sd_get_available_sessions(uint16_t *session_list, int max) {
     closedir(dir); return count;
 }
 
-// --- FUNÇÃO CORRIGIDA PARA O NOME DOS ARQUIVOS ---
 int sd_get_session_string_list(char *buffer, size_t max_len) {
     if (!mounted || !buffer) return 0;
     buffer[0] = '\0';
@@ -102,20 +123,15 @@ int sd_get_session_string_list(char *buffer, size_t max_len) {
     while ((ent = readdir(dir))) {
         if (strstr(ent->d_name, "laps_") && strstr(ent->d_name, ".csv")) {
             char clean_name[64];
-            
-            char *start = ent->d_name + 5; // Pula "laps_"
+            char *start = ent->d_name + 5; 
             char *end = strstr(ent->d_name, ".csv");
             
             if (start && end && end > start) {
-                // Cálculo seguro do tamanho
                 size_t len = end - start;
                 if (len > sizeof(clean_name) - 1) len = sizeof(clean_name) - 1;
-                
-                // [CORREÇÃO] Usando memcpy ao invés de strncpy para evitar o erro do compilador
                 memcpy(clean_name, start, len);
-                clean_name[len] = '\0'; // Garante o fim da string manualmente
+                clean_name[len] = '\0'; 
             } else {
-                // [CORREÇÃO] Usando snprintf para segurança
                 snprintf(clean_name, sizeof(clean_name), "%s", ent->d_name);
             }
             
@@ -152,8 +168,24 @@ void sd_load_session_history(uint16_t idx) {
     
     FILE *f = fopen(target, "r"); if (!f) return;
     char line[128];
+    // Pula o cabeçalho se existir
+    char first_line[128];
+    if (fgets(first_line, 128, f)) {
+        // Se a primeira linha começar com "Lap", é cabeçalho, então lemos a próxima.
+        // Se não começar (arquivo antigo sem cabeçalho), usamos sscanf nela mesma.
+        if (strstr(first_line, "Lap") == NULL) {
+             // Arquivo legado sem cabeçalho, processa a primeira linha
+             int lap; unsigned long s, ms; float avg;
+             if (sscanf(first_line, "%d,%lu.%lu,%f", &lap, &s, &ms, &avg) >= 4) {
+                 ui_add_lap_to_list(lap, (s * 1000) + ms);
+                 ui_add_point_to_chart(avg);
+             }
+        }
+    }
+
     while (fgets(line, 128, f)) {
         int lap; unsigned long s, ms; float avg;
+        // O sscanf vai ignorar o restante das colunas novas (Mode, Date, etc) pois só pedimos as 4 primeiras
         if (sscanf(line, "%d,%lu.%lu,%f", &lap, &s, &ms, &avg) >= 4) {
             ui_add_lap_to_list(lap, (s * 1000) + ms);
             ui_add_point_to_chart(avg);
@@ -172,9 +204,18 @@ void sd_get_info(float *used_gb, float *total_gb) {
     }
 }
 
+// [CORREÇÃO] Log de amostra com formato completo
 void sd_log_sample(gps_data_t gps, mpu_data_t mpu, race_mode_t mode, uint16_t lap) {
     if (f_telemetry) {
-        fprintf(f_telemetry, "%lu,%.6f,%.6f,%.1f,%d,%d\n", gps.timestamp_ms, gps.lat, gps.lon, gps.speed_kmh, (int)mode, lap);
+        // Formato: Timestamp_ms,Date,Time,Mode,Lap,Speed,Lat,Lon
+        fprintf(f_telemetry, "%lu,%02d/%02d/%02d,%02d:%02d:%02d,%s,%d,%.1f,%.6f,%.6f\n", 
+                gps.timestamp_ms,
+                gps.day, gps.month, gps.year,
+                gps.hour, gps.minute, gps.second,
+                (mode == MODE_CLASSIFICACAO ? "QUALY" : "RACE"),
+                lap,
+                gps.speed_kmh,
+                gps.lat, gps.lon);
     }
 }
 
