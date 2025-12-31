@@ -10,7 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-// DECLARAÇÃO DE FONTES
+// --- DECLARAÇÃO DE FONTES ---
 LV_FONT_DECLARE(font_montserrat_bold_80);   // Velocidade
 LV_FONT_DECLARE(font_montserrat_bold_70);   // Tempo de Volta
 LV_FONT_DECLARE(font_montserrat_medium_60); // Delta (Gap)
@@ -18,38 +18,53 @@ LV_FONT_DECLARE(font_montserrat_60);
 LV_FONT_DECLARE(font_montserrat_70);
 LV_FONT_DECLARE(font_montserrat_80);
 
+// --- VARIÁVEIS E FUNÇÕES EXTERNAS ---
 extern bool recording_active;
 extern void end_race_session(void);
 
+// Stub para compatibilidade com nomes reais de arquivos do SD
+extern int sd_get_session_string_list(char *buf, size_t max_len) __attribute__((weak));
+
+// --- PALETA DE CORES ---
 #define COLOR_BG        lv_color_hex(0x000000)
-#define COLOR_PRIMARY   lv_color_hex(0x00FF41) 
-#define COLOR_SECONDARY lv_color_hex(0xFFFF00) 
-#define COLOR_DANGER    lv_color_hex(0xFF0033) 
+#define COLOR_PRIMARY   lv_color_hex(0x00FF41) // Verde Matrix
+#define COLOR_SECONDARY lv_color_hex(0xFFFF00) // Amarelo Qualy
+#define COLOR_DANGER    lv_color_hex(0xFF0033) // Vermelho Erro
+#define COLOR_WARNING   lv_color_hex(0xFFCC00) // Laranja Busca
 #define COLOR_TEXT      lv_color_hex(0xFFFFFF)
 #define COLOR_PANEL     lv_color_hex(0x1A1A1A)
+#define COLOR_GRAY      lv_color_hex(0x888888)
 
+// --- OBJETOS GLOBAIS ---
 static lv_obj_t *tabview, *list_laps = NULL, *dd_sessions = NULL, *lbl_sd_storage = NULL;
 static lv_obj_t *lbl_speed, *lbl_lap_current, *lbl_lap_best, *lbl_lap_num, *lbl_gps_top, *lbl_mode, *lbl_race_name, *mode_border;
 static lv_obj_t *lbl_delta, *ui_reset_bar = NULL, *ui_chart = NULL, *lbl_chart_max_val = NULL;
 static lv_chart_series_t *ui_ser_speed = NULL;
 static uint32_t ui_best_ms = 0xFFFFFFFF;
 
-// Escala dinâmica: Começa com 40 km/h
+// Escala dinâmica do gráfico
 static float ui_session_max_speed = 40.0f; 
 static uint16_t ui_total_laps_in_chart = 0;
 
 static lv_style_t style_text_white, style_list_btn, style_big_font;
+
+// Flag de segurança para impedir cliques enquanto a tarefa de salvamento roda
 static volatile bool ui_is_saving_task_running = false;
 
-// --- PROTÓTIPOS ---
+// Variáveis para monitoramento de saúde do GPS
+static uint32_t last_gps_packet_time = 0;
+static uint32_t last_ui_tick_check = 0;
+
+// --- PROTÓTIPOS OBRIGATÓRIOS ---
 void ui_refresh_session_dropdown(void);
 void ui_update_sd_info(void);
 void ui_show_popup(const char *t, uint32_t d);
+void ui_show_mode_splash(race_mode_t m); // Faltava este protótipo
 void ui_clear_lap_list(void);
 void ui_hide_reset_progress(void);
 void ui_update_reset_progress(uint32_t progress);
 
-// --- FUNÇÕES AUXILIARES ---
+// --- FUNÇÕES AUXILIARES DE TEMPO ---
 
 static void format_time(char *buf, size_t len, uint32_t ms) {
     if (ms == 0) { snprintf(buf, len, "00:00.000"); return; }
@@ -61,13 +76,22 @@ static void delete_obj_timer_cb(lv_timer_t * t) {
     if (lv_obj_is_valid(obj)) lv_obj_delete(obj);
 }
 
-// --- CALLBACKS ---
+// --- CALLBACKS DE EVENTOS ---
 
 static void refresh_history_cb(lv_event_t * e) {
     if (ui_is_saving_task_running) return;
+
+    lv_obj_t * dropdown = (lv_obj_t *)lv_event_get_user_data(e);
+    uint16_t sel_idx = lv_dropdown_get_selected(dropdown);
+    
     ui_clear_lap_list();
     ui_show_popup("RECARREGANDO...", 500);
-    ui_refresh_session_dropdown(); // Recarrega a lista de arquivos
+    
+    // Atualiza a lista de arquivos (caso tenha novos)
+    ui_refresh_session_dropdown();
+    
+    // Carrega o selecionado
+    sd_load_session_history(sel_idx);
 }
 
 static void session_dropdown_cb(lv_event_t * e) {
@@ -111,19 +135,21 @@ static void btn_delete_trigger_cb(lv_event_t * e) {
     lv_obj_t * lt2 = lv_label_create(b2); lv_label_set_text(lt2, "NAO"); lv_obj_center(lt2);
 }
 
-// --- TASK DEDICADA PARA SALVAR ---
+// --- TAREFA DEDICADA PARA SALVAR (FIX CRASH) ---
 
 static void ui_notify_save_finished(void * arg) {
     ui_show_popup("SESSAO SALVA", 1500);
     ui_is_saving_task_running = false; 
-    ui_refresh_session_dropdown(); 
+    ui_refresh_session_dropdown(); // Atualiza a lista após salvar
 }
 
 static void save_session_worker_task(void * arg) {
     if (recording_active) {
-        end_race_session();
+        end_race_session(); // Operação pesada de I/O
     }
+    // Agenda a notificação na thread da UI
     lv_async_call(ui_notify_save_finished, NULL);
+    // Mata a tarefa worker
     vTaskDelete(NULL);
 }
 
@@ -151,6 +177,7 @@ static void digital_btn_cb(lv_event_t * e) {
                 
                 if (recording_active) {
                     ui_is_saving_task_running = true; 
+                    // Cria tarefa dedicada com 4KB de pilha
                     xTaskCreate(save_session_worker_task, "SaveTask", 4096, NULL, 5, NULL);
                 } else {
                     ui_show_popup("SEM CORRIDA ATIVA", 1000);
@@ -163,6 +190,7 @@ static void digital_btn_cb(lv_event_t * e) {
             uint32_t elapsed = lv_tick_elaps(press_start_tick);
             ui_hide_reset_progress();
 
+            // CLIQUE CURTO: Só reseta se NÃO estiver gravando
             if(!long_press_triggered && elapsed < 500) {
                 if(!recording_active) {
                     gps_reset_session(); 
@@ -194,7 +222,7 @@ static void digital_btn_cb(lv_event_t * e) {
     }
 }
 
-// --- UI INIT ---
+// --- INICIALIZAÇÃO DA INTERFACE ---
 
 void ui_init(void) {
     lv_style_init(&style_text_white);
@@ -234,7 +262,7 @@ void ui_init(void) {
     lv_obj_set_style_bg_color(t1, COLOR_BG, 0);
     lv_obj_set_style_pad_all(t1, 0, 0);
 
-    // ABA 1
+    // --- ABA 1: RACE ---
     lbl_speed = lv_label_create(t1);
     lv_obj_add_style(lbl_speed, &style_big_font, 0);
     lv_obj_set_style_text_font(lbl_speed, &font_montserrat_bold_80, 0); 
@@ -314,7 +342,8 @@ void ui_init(void) {
     lv_obj_remove_flag(mode_border, LV_OBJ_FLAG_CLICKABLE); 
     lv_obj_add_flag(mode_border, LV_OBJ_FLAG_IGNORE_LAYOUT);
 
-    // ABA 2
+    // --- ABA 2: VOLTAS ---
+    
     dd_sessions = lv_dropdown_create(t2);
     lv_obj_set_size(dd_sessions, 230, 45); 
     lv_obj_align(dd_sessions, LV_ALIGN_TOP_LEFT, 20, 10);
@@ -338,6 +367,7 @@ void ui_init(void) {
     lv_chart_set_type(ui_chart, LV_CHART_TYPE_BAR);
     lv_chart_set_range(ui_chart, LV_CHART_AXIS_PRIMARY_Y, 0, (int32_t)ui_session_max_speed);
     
+    // Divisões visuais
     lv_chart_set_div_line_count(ui_chart, 5, 10); 
 
     ui_ser_speed = lv_chart_add_series(ui_chart, COLOR_PRIMARY, LV_CHART_AXIS_PRIMARY_Y);
@@ -357,7 +387,7 @@ void ui_init(void) {
     lv_obj_align(list_laps, LV_ALIGN_BOTTOM_MID, 0, -10);
     lv_obj_set_style_bg_color(list_laps, COLOR_BG, 0);
 
-    // ABA 3
+    // --- ABA 3: CFG ---
     lbl_sd_storage = lv_label_create(t3);
     lv_obj_add_style(lbl_sd_storage, &style_text_white, 0);
     lv_obj_set_style_text_font(lbl_sd_storage, &lv_font_montserrat_32, 0);
@@ -371,46 +401,26 @@ void ui_init(void) {
     lv_obj_t * lt_del = lv_label_create(b_del); lv_label_set_text(lt_del, "APAGAR TUDO (SD CARD)"); lv_obj_center(lt_del);
 }
 
-// --- ATUALIZAÇÕES ---
-
-void ui_update_sd_info(void) {
-    if (!lbl_sd_storage) return;
-    float used, total;
-    sd_get_info(&used, &total);
-    static char buf[128];
-    if (total > 0) snprintf(buf, sizeof(buf), "SD: %.2fGB / %.2fGB", used, total);
-    else snprintf(buf, sizeof(buf), "SD: NAO DETECTADO");
-    lv_label_set_text(lbl_sd_storage, buf);
-}
-
-void ui_show_mode_splash(race_mode_t m) {
-    lv_obj_t *obj = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(obj, 800, 480); lv_obj_center(obj);
-    lv_obj_set_style_bg_color(obj, m == MODE_CLASSIFICACAO ? COLOR_SECONDARY : COLOR_PRIMARY, 0);
-    lv_obj_set_style_bg_opa(obj, LV_OPA_90, 0);
-    lv_obj_t *l = lv_label_create(obj);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_48, 0);
-    lv_obj_set_style_text_color(l, COLOR_BG, 0);
-    lv_label_set_text(l, m == MODE_CLASSIFICACAO ? "MODO QUALY" : "MODO CORRIDA");
-    lv_obj_center(l);
-    lv_timer_t * t = lv_timer_create(delete_obj_timer_cb, 1000, obj);
-    lv_timer_set_repeat_count(t, 1);
-}
-
-void ui_show_popup(const char *t, uint32_t d) {
-    lv_obj_t *p = lv_obj_create(lv_layer_top()); 
-    lv_obj_set_size(p, 450, 160); lv_obj_center(p);
-    lv_obj_set_style_bg_color(p, COLOR_PANEL, 0);
-    lv_obj_t *l = lv_label_create(p);
-    lv_label_set_text(l, t); lv_obj_add_style(l, &style_text_white, 0); lv_obj_center(l);
-    lv_timer_t * timer = lv_timer_create(delete_obj_timer_cb, d, p);
-    lv_timer_set_repeat_count(timer, 1);
-}
+// --- FUNÇÃO UI UPDATE COM DIAGNÓSTICO DE CORES ---
 
 void ui_update(gps_data_t gps, mpu_data_t mpu, uint32_t cur_time, uint32_t last_lap, uint32_t best_lap, uint16_t laps, uint16_t race_id) {
     if (ui_is_saving_task_running) return;
 
-    static char buf[256];
+    static char buf[64];
+
+    // 1. Diagnóstico de Hardware (Heartbeat)
+    bool hardware_ok = false;
+    
+    if (gps.timestamp_ms != last_gps_packet_time) {
+        last_gps_packet_time = gps.timestamp_ms;
+        last_ui_tick_check = lv_tick_get();
+        hardware_ok = true;
+    } else {
+        if (lv_tick_elaps(last_ui_tick_check) < 2500) {
+            hardware_ok = true;
+        }
+    }
+
     snprintf(buf, sizeof(buf), "%d KM/H", (int)gps.speed_kmh); lv_label_set_text(lbl_speed, buf);
     snprintf(buf, sizeof(buf), "VOLTA %u", laps); lv_label_set_text(lbl_lap_num, buf);
     format_time(buf, sizeof(buf), cur_time); lv_label_set_text(lbl_lap_current, buf);
@@ -428,19 +438,22 @@ void ui_update(gps_data_t gps, mpu_data_t mpu, uint32_t cur_time, uint32_t last_
     lv_label_set_text(lbl_mode, q ? "MODO: QUALY" : "MODO: RACE");
     lv_obj_set_style_border_color(mode_border, q ? COLOR_SECONDARY : COLOR_PRIMARY, 0);
 
-    if (gps.valid) {
+    // 2. Atualiza Status do GPS com Cores Personalizadas
+    if (!hardware_ok) {
+        lv_label_set_text(lbl_gps_top, "GPS: ERRO HW"); 
+        lv_obj_set_style_text_color(lbl_gps_top, COLOR_DANGER, 0); // VERMELHO
+    } 
+    else if (gps.valid) {
         snprintf(buf, sizeof(buf), "SATS: %d FIX", gps.sats);
-        lv_obj_set_style_text_color(lbl_gps_top, COLOR_PRIMARY, 0);
-    } else {
-        snprintf(buf, sizeof(buf), "SATS: %d NO FIX", gps.sats);
-        lv_obj_set_style_text_color(lbl_gps_top, COLOR_DANGER, 0);
+        lv_label_set_text(lbl_gps_top, buf);
+        lv_obj_set_style_text_color(lbl_gps_top, COLOR_PRIMARY, 0); // VERDE
+    } 
+    else {
+        snprintf(buf, sizeof(buf), "SATS: %d BUSCA...", gps.sats);
+        lv_label_set_text(lbl_gps_top, buf);
+        lv_obj_set_style_text_color(lbl_gps_top, COLOR_WARNING, 0); // LARANJA
     }
-    lv_label_set_text(lbl_gps_top, buf);
 
-    // Se estiver gravando, o race_id é o atual. Se não, é o que o usuário escolheu?
-    // Aqui assumimos que se recording_active é true, mostramos o ID atual.
-    // Mas para exibir o nome do arquivo aqui, precisaria passar o nome para ui_update.
-    // Por enquanto, mantemos "CORRIDA X" aqui no display principal.
     snprintf(buf, sizeof(buf), "CORRIDA %u", race_id);
     lv_label_set_text(lbl_race_name, buf);
 }
@@ -502,14 +515,63 @@ void ui_add_lap_to_list(uint16_t num, uint32_t ms) {
 void ui_refresh_session_dropdown(void) {
     if (!dd_sessions) return;
     
-    // Tenta usar a nova função do SD para pegar nomes reais
-    char *buf = malloc(4096); 
-    if (buf) {
-        if (sd_get_session_string_list(buf, 4096) > 0) {
-            lv_dropdown_set_options(dd_sessions, buf);
-        } else {
-            lv_dropdown_set_options(dd_sessions, "Vazio");
+    // Tenta usar a função de nomes reais do telemetry_sd.c
+    if (sd_get_session_string_list) {
+        char *buf = malloc(4096); 
+        if (buf) {
+            if (sd_get_session_string_list(buf, 4096) > 0) {
+                lv_dropdown_set_options(dd_sessions, buf);
+            } else {
+                lv_dropdown_set_options(dd_sessions, "Vazio");
+            }
+            free(buf);
+            return;
         }
-        free(buf);
     }
+
+    // Fallback para contagem simples se a função não existir
+    uint16_t sessions[50]; int count = sd_get_available_sessions(sessions, 50);
+    if (count == 0) { lv_dropdown_set_options(dd_sessions, "Vazio"); return; }
+    char *buf = malloc(4096); buf[0] = '\0';
+    for (int i = 0; i < count; i++) { 
+        char t[64]; snprintf(t, 64, "SESSION_%03d.LOG\n", sessions[i]); strcat(buf, t);
+    }
+    lv_dropdown_set_options(dd_sessions, buf);
+    free(buf);
+}
+
+// --- IMPLEMENTAÇÃO DAS FUNÇÕES AUXILIARES QUE FALTAVAM ---
+
+void ui_update_sd_info(void) {
+    if (!lbl_sd_storage) return;
+    float used, total;
+    sd_get_info(&used, &total);
+    static char buf[128];
+    if (total > 0) snprintf(buf, sizeof(buf), "SD: %.2fGB / %.2fGB", used, total);
+    else snprintf(buf, sizeof(buf), "SD: NAO DETECTADO");
+    lv_label_set_text(lbl_sd_storage, buf);
+}
+
+void ui_show_mode_splash(race_mode_t m) {
+    lv_obj_t *obj = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(obj, 800, 480); lv_obj_center(obj);
+    lv_obj_set_style_bg_color(obj, m == MODE_CLASSIFICACAO ? COLOR_SECONDARY : COLOR_PRIMARY, 0);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_90, 0);
+    lv_obj_t *l = lv_label_create(obj);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(l, COLOR_BG, 0);
+    lv_label_set_text(l, m == MODE_CLASSIFICACAO ? "MODO QUALY" : "MODO CORRIDA");
+    lv_obj_center(l);
+    lv_timer_t * t = lv_timer_create(delete_obj_timer_cb, 1000, obj);
+    lv_timer_set_repeat_count(t, 1);
+}
+
+void ui_show_popup(const char *t, uint32_t d) {
+    lv_obj_t *p = lv_obj_create(lv_layer_top()); 
+    lv_obj_set_size(p, 450, 160); lv_obj_center(p);
+    lv_obj_set_style_bg_color(p, COLOR_PANEL, 0);
+    lv_obj_t *l = lv_label_create(p);
+    lv_label_set_text(l, t); lv_obj_add_style(l, &style_text_white, 0); lv_obj_center(l);
+    lv_timer_t * timer = lv_timer_create(delete_obj_timer_cb, d, p);
+    lv_timer_set_repeat_count(timer, 1);
 }
