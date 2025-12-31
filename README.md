@@ -55,3 +55,22 @@ Diagnóstico visual avançado no topo da tela:
 ├── telemetry_sd.c      # Gerenciamento de Arquivos e Logs
 ├── telemetry_mpu.c     # Leitura de sensores inerciais
 └── ...
+
+🎮 Como Usar
+Inicialização: Ao ligar, aguarde o status do GPS ficar VERDE (FIX).
+
+Marcar Linha de Chegada: Na primeira volta, pressione "MARCAR" onde deseja definir a linha de chegada/largada.
+
+Correr: O sistema detectará as voltas automaticamente via coordenadas GPS.
+
+Salvar: Ao fim da corrida, segure o botão "RESET" por 2 segundos.
+
+Nota: O salvamento ocorre em background. Uma barra de progresso indicará a conclusão.
+
+Revisar: Vá até a aba "VOLTAS", selecione a corrida e clique no botão de Refresh 🔄 para ver o gráfico de desempenho.
+
+🤝 Contribuição
+Contribuições são bem-vindas! Sinta-se à vontade para abrir Issues ou enviar Pull Requests.
+
+📜 Licença
+Este projeto está sob a licença MIT. Sinta-se livre para usar e modificar.
